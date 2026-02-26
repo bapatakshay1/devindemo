@@ -562,31 +562,58 @@ def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
-def send_slack_notification(issue_number: int, session_url: str) -> None:
-    """Print a mock Slack webhook notification to the terminal.
+def send_slack_notification(
+    issue: Issue,
+    session_url: str,
+    repo_name: str,
+) -> None:
+    """Print a rich mock Slack webhook notification to the terminal.
 
-    Formats the message as a Slack-style threaded notification, indicating
-    that all subsequent progress updates will be posted as thread replies
-    to keep the channel clean.
+    Includes issue title, complexity score, assigned branch name, and a
+    simulated threaded "PR Ready" follow-up message.
 
     Args:
-        issue_number: The GitHub issue number being resolved.
+        issue: The GitHub issue being resolved.
         session_url: The Devin session URL for tracking progress.
+        repo_name: The repository name (owner/repo).
     """
+    scores = mock_llm_evaluate(issue)
+    complexity = scores["complexity"]
+    complexity_score = scores["complexity_score"]
+    branch_name = f"devin/fix-issue-{issue.number}"
+
     border = "*" * 72
+    thin = "-" * 72
+
+    # --- Main notification ---
     print(f"\n{border}")
-    print(
-        f"  \U0001f514 SLACK WEBHOOK FIRED: Devin has begun work on "
-        f"Issue #{issue_number}."
-    )
-    print(f"  Track progress here: {session_url}")
+    print("  \U0001f514  SLACK  \u2014  #eng-devin-automation")
+    print(border)
+    print(f"  \U0001f916 *Devin Automation Triggered*  \u2014  Issue #{issue.number}")
+    print(f"  *Title:*       {issue.title[:60]}")
+    print(f"  *Repo:*        {repo_name}")
+    print(f"  *Complexity:*  {complexity} ({complexity_score}/100)")
+    print(f"  *Branch:*      `{branch_name}`")
+    print(f"  *Session:*     {session_url}")
     print()
     print(
         "  \U0001f9f5 All progress updates will be posted as thread replies "
         "to this message"
     )
     print("     to avoid channel noise. Follow the thread for real-time status.")
-    print(f"{border}\n")
+    print(border)
+
+    # --- Simulated threaded reply: PR Ready ---
+    print(f"  {thin}")
+    print("  \U0001f4ac  Thread reply (simulated)")
+    print(f"  {thin}")
+    print(
+        f"  \u2705 *PR Ready* \u2014 Devin has opened a pull request for "
+        f"Issue #{issue.number}."
+    )
+    print(f"  *Branch:* `{branch_name}` \u2192 `main`")
+    print(f"  *Review:* https://github.com/{repo_name}/compare/{branch_name}")
+    print(f"  {thin}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +651,7 @@ def _dispatch_single_issue(
     post_github_comment(issue, session_url)
 
     # Mock Slack notification
-    send_slack_notification(issue.number, session_url)
+    send_slack_notification(issue, session_url, repo_name)
 
     return {
         "issue_number": issue.number,
