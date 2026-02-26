@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -92,33 +94,107 @@ def fetch_labelled_issues(
     return issues
 
 
-def mock_llm_evaluate(title: str, body: str) -> dict[str, Any]:
-    """Simulate an LLM evaluation of an issue's complexity.
+def mock_llm_evaluate(issue: Issue) -> dict[str, Any]:
+    """Simulate an LLM evaluation using realistic heuristics.
 
-    Uses a deterministic hash so the same issue always returns the same
-    scores, making demos reproducible.
+    Scores are derived from observable issue metadata so results feel
+    plausible in a demo.  The function is still deterministic (same issue
+    always yields the same scores).
+
+    Heuristics used:
+    * **Body length** -- longer descriptions suggest more complex work.
+    * **Label count** -- more labels often means cross-cutting concerns.
+    * **Comment count** -- lots of discussion implies ambiguity / complexity.
+    * **Issue age** -- older issues may have bit-rotted and need more context.
 
     Args:
-        title: The issue title.
-        body: The issue body / description.
+        issue: A GitHub issue object.
 
     Returns:
-        A dict with ``complexity`` (Low / Medium / High) and
-        ``confidence`` (int percentage 50-99).
+        A dict with keys:
+        - ``complexity``  : "Low" / "Medium" / "High"
+        - ``confidence``  : int percentage 50-99
+        - ``staleness``   : "Fresh" / "Aging" / "Stale"
+        - ``age_days``    : int
+        - ``signals``     : dict of raw heuristic values
     """
+    title = issue.title
+    body = issue.body or ""
+    label_count = len(list(issue.labels))
+    comment_count = issue.comments  # int provided by the API
+    body_length = len(body)
+
+    now = datetime.now(tz=timezone.utc)
+    created = (
+        issue.created_at.replace(tzinfo=timezone.utc)
+        if issue.created_at.tzinfo is None
+        else issue.created_at
+    )
+    age_days = (now - created).days
+
+    # --- Complexity score (0-100) -------------------------------------------
+    # Each signal contributes a weighted sub-score.
+    body_score = min(body_length / 2000, 1.0) * 30  # max 30 pts
+    label_score = min(label_count / 5, 1.0) * 20  # max 20 pts
+    comment_score = min(comment_count / 10, 1.0) * 25  # max 25 pts
+    age_score = min(age_days / 180, 1.0) * 25  # max 25 pts
+
+    raw_complexity = body_score + label_score + comment_score + age_score
+
+    # Add a small deterministic jitter so identical-metadata issues differ
     digest = hashlib.sha256(f"{title}:{body}".encode()).hexdigest()
-    hash_int = int(digest[:8], 16)
+    jitter = (int(digest[:4], 16) % 10) - 5  # range -5..+4
+    raw_complexity = max(0, min(100, raw_complexity + jitter))
 
-    complexity_levels = ["Low", "Medium", "High"]
-    complexity = complexity_levels[hash_int % 3]
+    if raw_complexity < 35:
+        complexity = "Low"
+    elif raw_complexity < 65:
+        complexity = "Medium"
+    else:
+        complexity = "High"
 
-    confidence = 50 + (hash_int % 50)  # range 50-99
+    # --- Confidence score (50-99) -------------------------------------------
+    # More data points -> higher confidence.
+    data_richness = sum(
+        [
+            1 if body_length > 100 else 0,
+            1 if label_count >= 1 else 0,
+            1 if comment_count >= 1 else 0,
+            1 if age_days > 7 else 0,
+        ]
+    )
+    base_confidence = 55 + data_richness * 10  # 55-95
+    # Deterministic micro-jitter
+    confidence = min(99, max(50, base_confidence + (int(digest[4:6], 16) % 5)))
 
-    return {"complexity": complexity, "confidence": confidence}
+    # --- Staleness label ----------------------------------------------------
+    if age_days < 14:
+        staleness = "Fresh"
+    elif age_days < 90:
+        staleness = "Aging"
+    else:
+        staleness = "Stale"
+
+    return {
+        "complexity": complexity,
+        "complexity_score": math.floor(raw_complexity),
+        "confidence": confidence,
+        "staleness": staleness,
+        "age_days": age_days,
+        "signals": {
+            "body_length": body_length,
+            "label_count": label_count,
+            "comment_count": comment_count,
+            "age_days": age_days,
+        },
+    }
 
 
 def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
     """Print a formatted triage report and return a lookup dict.
+
+    The report now includes staleness, age, and the raw complexity score
+    alongside the categorical labels, giving the operator more signal.
 
     Args:
         issues: List of GitHub issues to report on.
@@ -126,22 +202,34 @@ def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
     Returns:
         A mapping of issue number -> Issue for quick lookup.
     """
-    separator = "=" * 80
+    separator = "=" * 96
     print(f"\n{separator}")
     print("  FINSERV CO  --  AUTOMATED ISSUE TRIAGE REPORT")
     print(separator)
-    print(f"{'#':<8} {'Complexity':<12} {'Confidence':<12} {'Title'}")
-    print("-" * 80)
+    print(
+        f"{'#':<8} {'Complexity':<12} {'Score':<7} {'Confidence':<12} "
+        f"{'Staleness':<10} {'Age':<8} {'Title'}"
+    )
+    print("-" * 96)
 
     lookup: dict[int, Issue] = {}
     for issue in issues:
-        scores = mock_llm_evaluate(issue.title, issue.body or "")
+        scores = mock_llm_evaluate(issue)
+        age_str = f"{scores['age_days']}d"
         print(
             f"#{issue.number:<7} {scores['complexity']:<12} "
-            f"{scores['confidence']}%{'':<10} {issue.title[:50]}"
+            f"{scores['complexity_score']:<7} "
+            f"{scores['confidence']}%{'':<10} "
+            f"{scores['staleness']:<10} {age_str:<8} "
+            f"{issue.title[:40]}"
         )
         lookup[issue.number] = issue
 
+    print(separator)
+    print(
+        "  Signals: body length, label count, comment count, issue age. "
+        "Score range 0-100."
+    )
     print(separator + "\n")
     return lookup
 
