@@ -18,6 +18,7 @@ import hashlib
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import requests
@@ -150,35 +151,72 @@ def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
 # ---------------------------------------------------------------------------
 
 
-def prompt_user_selection(lookup: dict[int, Issue]) -> Issue | None:
-    """Interactively ask the operator to select an issue.
+def prompt_user_selection(lookup: dict[int, Issue]) -> list[Issue]:
+    """Interactively ask the operator to select one or more issues.
+
+    Supports batch selection via comma-separated issue numbers, the keyword
+    ``all`` to select every issue in the triage report, or ``q`` to quit.
 
     Args:
         lookup: Mapping of issue number to Issue object.
 
     Returns:
-        The selected :class:`Issue`, or ``None`` if the user quits.
+        A list of selected :class:`Issue` objects (may be empty if the user
+        quits).
     """
+    print(
+        "Tip: Enter comma-separated numbers (e.g. 1,4,7) or 'all' to select every issue."
+    )
     while True:
         choice = input(
-            "Enter the Issue Number you would like Devin to resolve (or 'q' to quit): "
+            "Enter Issue Number(s) for Devin to resolve (or 'q' to quit): "
         ).strip()
 
         if choice.lower() == "q":
             logger.info("User chose to quit. Exiting.")
-            return None
+            return []
 
-        try:
-            issue_number = int(choice)
-        except ValueError:
-            print(f"  Invalid input '{choice}'. Please enter a number or 'q'.")
+        if choice.lower() == "all":
+            selected = list(lookup.values())
+            logger.info("User selected ALL %d issues.", len(selected))
+            return selected
+
+        # Parse comma-separated numbers
+        raw_numbers = [tok.strip() for tok in choice.split(",") if tok.strip()]
+        selected: list[Issue] = []
+        invalid = False
+        for tok in raw_numbers:
+            try:
+                num = int(tok)
+            except ValueError:
+                print(f"  Invalid input '{tok}'. Please enter numbers or 'q'.")
+                invalid = True
+                break
+            if num not in lookup:
+                print(f"  Issue #{num} is not in the triage report. Try again.")
+                invalid = True
+                break
+            selected.append(lookup[num])
+
+        if invalid:
             continue
 
-        if issue_number not in lookup:
-            print(f"  Issue #{issue_number} is not in the triage report. Try again.")
+        if not selected:
+            print("  No issues selected. Try again.")
             continue
 
-        return lookup[issue_number]
+        # Deduplicate while preserving order
+        seen: set[int] = set()
+        deduped: list[Issue] = []
+        for iss in selected:
+            if iss.number not in seen:
+                seen.add(iss.number)
+                deduped.append(iss)
+
+        logger.info(
+            "User selected %d issue(s): %s", len(deduped), [i.number for i in deduped]
+        )
+        return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -229,10 +267,8 @@ def create_devin_session(
         prompt: The detailed prompt for Devin.
 
     Returns:
-        The parsed JSON response from the API.
-
-    Raises:
-        SystemExit: If the API call fails.
+        The parsed JSON response from the API.  On failure returns a dict
+        with an ``error`` key so batch dispatch can continue.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -250,15 +286,16 @@ def create_devin_session(
         )
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
-        logger.error(
-            "Devin API returned HTTP %s: %s",
-            exc.response.status_code if exc.response is not None else "N/A",
-            exc.response.text if exc.response is not None else str(exc),
+        msg = (
+            f"HTTP {exc.response.status_code}: {exc.response.text}"
+            if exc.response is not None
+            else str(exc)
         )
-        sys.exit(1)
+        logger.error("Devin API error: %s", msg)
+        return {"error": msg}
     except requests.exceptions.RequestException as exc:
         logger.error("Failed to reach Devin API: %s", exc)
-        sys.exit(1)
+        return {"error": str(exc)}
 
     data: dict[str, Any] = response.json()
     logger.info("Devin session created successfully.")
@@ -328,6 +365,88 @@ def send_slack_notification(issue_number: int, session_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dispatch_single_issue(
+    issue: Issue,
+    repo_name: str,
+    api_key: str,
+) -> dict[str, Any]:
+    """Build prompt, create a Devin session, comment, and notify for one issue.
+
+    Returns a result dict with ``issue_number``, ``session_id``,
+    ``session_url``, and optionally ``error``.
+    """
+    prompt = build_devin_prompt(issue, repo_name)
+    response_data = create_devin_session(api_key, prompt)
+
+    if "error" in response_data:
+        return {
+            "issue_number": issue.number,
+            "error": response_data["error"],
+        }
+
+    session_id = response_data.get("session_id", "unknown")
+    session_url = response_data.get(
+        "url", f"https://app.devin.ai/sessions/{session_id}"
+    )
+
+    logger.info("Issue #%d -> Session %s (%s)", issue.number, session_id, session_url)
+
+    # Post comment on the GitHub issue
+    post_github_comment(issue, session_url)
+
+    # Mock Slack notification
+    send_slack_notification(issue.number, session_url)
+
+    return {
+        "issue_number": issue.number,
+        "session_id": session_id,
+        "session_url": session_url,
+    }
+
+
+def dispatch_issues(
+    selected_issues: list[Issue],
+    repo_name: str,
+    api_key: str,
+    max_workers: int = 5,
+) -> list[dict[str, Any]]:
+    """Dispatch Devin sessions for multiple issues in parallel.
+
+    Args:
+        selected_issues: Issues chosen by the operator.
+        repo_name: Full ``owner/repo`` repository name.
+        api_key: Devin API bearer token.
+        max_workers: Maximum parallel Devin API calls.
+
+    Returns:
+        A list of result dicts, one per issue.
+    """
+    if len(selected_issues) == 1:
+        return [_dispatch_single_issue(selected_issues[0], repo_name, api_key)]
+
+    logger.info(
+        "Dispatching %d issues in parallel (max_workers=%d)...",
+        len(selected_issues),
+        max_workers,
+    )
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_issue = {
+            executor.submit(_dispatch_single_issue, issue, repo_name, api_key): issue
+            for issue in selected_issues
+        }
+        for future in as_completed(future_to_issue):
+            issue = future_to_issue[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.error("Dispatch failed for Issue #%d: %s", issue.number, exc)
+                result = {"issue_number": issue.number, "error": str(exc)}
+            results.append(result)
+
+    return results
+
+
 def main() -> None:
     """Run the full triage-and-resolve pipeline."""
     logger.info("Starting FinServ Co Issue Triage Pipeline")
@@ -348,39 +467,35 @@ def main() -> None:
     lookup = print_triage_report(issues)
 
     # 2. Human-in-the-Loop
-    selected_issue = prompt_user_selection(lookup)
-    if selected_issue is None:
+    selected_issues = prompt_user_selection(lookup)
+    if not selected_issues:
         sys.exit(0)
 
     logger.info(
-        "User selected Issue #%d: %s",
-        selected_issue.number,
-        selected_issue.title,
+        "Dispatching Devin for %d issue(s): %s",
+        len(selected_issues),
+        [i.number for i in selected_issues],
     )
 
-    # 3. Devin API Execution
-    prompt = build_devin_prompt(selected_issue, GITHUB_REPO_NAME)
-    logger.debug("Devin prompt:\n%s", prompt)
+    # 3 & 4. Parallel Devin API Execution + Communication
+    results = dispatch_issues(selected_issues, GITHUB_REPO_NAME, DEVIN_API_KEY)
 
-    response_data = create_devin_session(DEVIN_API_KEY, prompt)
+    # Print dispatch summary
+    successes = [r for r in results if "error" not in r]
+    failures = [r for r in results if "error" in r]
 
-    session_id = response_data.get("session_id", "unknown")
-    session_url = response_data.get(
-        "url", f"https://app.devin.ai/sessions/{session_id}"
-    )
+    print("\n" + "=" * 80)
+    print("  DISPATCH SUMMARY")
+    print("=" * 80)
+    print(f"  Total dispatched : {len(results)}")
+    print(f"  Succeeded        : {len(successes)}")
+    print(f"  Failed           : {len(failures)}")
+    if failures:
+        for f in failures:
+            print(f"    - Issue #{f['issue_number']}: {f['error']}")
+    print("=" * 80 + "\n")
 
-    logger.info("Devin Session ID : %s", session_id)
-    logger.info("Devin Session URL: %s", session_url)
-
-    # 3b. Post a comment on the GitHub issue
-    post_github_comment(selected_issue, session_url)
-
-    # 4. Communication
-    send_slack_notification(selected_issue.number, session_url)
-
-    logger.info(
-        "Pipeline complete. Devin is now working on Issue #%d.", selected_issue.number
-    )
+    logger.info("Pipeline complete. %d session(s) created.", len(successes))
 
 
 if __name__ == "__main__":
