@@ -709,26 +709,101 @@ def main() -> None:
     # 3 & 4. Parallel Devin API Execution + Communication
     results = dispatch_issues(selected_issues, GITHUB_REPO_NAME, DEVIN_API_KEY)
 
-    # Print dispatch summary
-    successes = [r for r in results if "error" not in r]
-    failures = [r for r in results if "error" in r]
-
-    print("\n" + "=" * 80)
-    print("  DISPATCH SUMMARY")
-    print("=" * 80)
-    print(f"  Total dispatched : {len(results)}")
-    print(f"  Succeeded        : {len(successes)}")
-    print(f"  Failed           : {len(failures)}")
-    if failures:
-        for f in failures:
-            print(f"    - Issue #{f['issue_number']}: {f['error']}")
-    print("=" * 80 + "\n")
+    # Print executive summary dashboard
+    print_summary_dashboard(results, selected_issues)
 
     # 5. Session status polling (optional)
+    successes = [r for r in results if "error" not in r]
     if successes:
         _offer_session_polling(successes, DEVIN_API_KEY)
 
     logger.info("Pipeline complete. %d session(s) created.", len(successes))
+
+
+# ---------------------------------------------------------------------------
+# Summary Dashboard
+# ---------------------------------------------------------------------------
+
+# Estimated engineer-hours saved per complexity level (for ROI projection)
+_TIME_SAVED_HOURS = {"Low": 1.5, "Medium": 4.0, "High": 8.0}
+
+
+def print_summary_dashboard(
+    results: list[dict[str, Any]],
+    dispatched_issues: list[Issue],
+) -> None:
+    """Print an executive-friendly summary dashboard.
+
+    Includes per-issue dispatch status, complexity breakdown, and an
+    estimated engineer-hours saved projection.
+
+    Args:
+        results: Dispatch result dicts (one per issue, may contain ``error``).
+        dispatched_issues: The Issue objects that were dispatched.
+    """
+    successes = [r for r in results if "error" not in r]
+    failures = [r for r in results if "error" in r]
+
+    # Build a quick lookup: issue_number -> Issue
+    issue_map: dict[int, Issue] = {iss.number: iss for iss in dispatched_issues}
+
+    # Compute complexity breakdown & time-saved estimate
+    complexity_counts: dict[str, int] = {"Low": 0, "Medium": 0, "High": 0}
+    total_hours_saved = 0.0
+    for result in successes:
+        iss = issue_map.get(result["issue_number"])
+        if iss:
+            scores = mock_llm_evaluate(iss)
+            comp = scores["complexity"]
+            complexity_counts[comp] = complexity_counts.get(comp, 0) + 1
+            total_hours_saved += _TIME_SAVED_HOURS.get(comp, 2.0)
+
+    sep = "=" * 80
+    print(f"\n{sep}")
+    print("  FINSERV CO  --  DISPATCH SUMMARY DASHBOARD")
+    print(sep)
+
+    # --- Overview ---
+    print(f"\n  Total issues dispatched : {len(results)}")
+    print(f"  Sessions created        : {len(successes)}")
+    print(f"  Failed to dispatch      : {len(failures)}")
+
+    # --- Per-issue detail table ---
+    print(f"\n  {'#':<8} {'Status':<12} {'Session / Error':<50} {'Title'}")
+    print("  " + "-" * 76)
+    for result in results:
+        inum = result["issue_number"]
+        title = issue_map[inum].title[:35] if inum in issue_map else "?"
+        if "error" in result:
+            status = "FAILED"
+            detail = result["error"][:48]
+        else:
+            status = "OK"
+            detail = result.get("session_id", "?")[:48]
+        print(f"  #{inum:<7} {status:<12} {detail:<50} {title}")
+
+    # --- Complexity breakdown ---
+    print("\n  Complexity Breakdown:")
+    for level in ("Low", "Medium", "High"):
+        count = complexity_counts[level]
+        bar = "\u2588" * count + "\u2591" * (max(0, 10 - count))
+        print(f"    {level:<8} {bar}  {count}")
+
+    # --- ROI estimate ---
+    print(f"\n  Estimated engineer-hours saved : {total_hours_saved:.1f}h")
+    print(
+        f"  (Based on {_TIME_SAVED_HOURS['Low']}h/Low, "
+        f"{_TIME_SAVED_HOURS['Medium']}h/Med, "
+        f"{_TIME_SAVED_HOURS['High']}h/High per issue)"
+    )
+
+    # --- Failures ---
+    if failures:
+        print("\n  Failed dispatches:")
+        for f in failures:
+            print(f"    - Issue #{f['issue_number']}: {f['error']}")
+
+    print(f"\n{sep}\n")
 
 
 def _offer_session_polling(successes: list[dict[str, Any]], api_key: str) -> None:
