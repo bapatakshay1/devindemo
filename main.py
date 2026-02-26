@@ -26,7 +26,7 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from github import Github
+from github import Auth, Github
 from github.Issue import Issue
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ DEVIN_API_KEY: str = os.getenv("DEVIN_API_KEY", "")
 GITHUB_REPO_NAME: str = os.getenv("GITHUB_REPO_NAME", "")
 GITHUB_ISSUE_LABEL: str = os.getenv("GITHUB_ISSUE_LABEL", "devin-backlog")
 
-DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
+DEVIN_API_URL = os.getenv("DEVIN_API_URL", "https://api.devin.ai/v1/sessions")
 DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 
@@ -84,7 +84,7 @@ def fetch_labelled_issues(
         A list of :class:`github.Issue.Issue` objects.
     """
     logger.info("Connecting to GitHub repository: %s", repo_name)
-    gh = Github(token)
+    gh = Github(auth=Auth.Token(token))
     try:
         repo = gh.get_repo(repo_name)
     except Exception as exc:
