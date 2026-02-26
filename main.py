@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
@@ -44,6 +45,8 @@ GITHUB_REPO_NAME: str = os.getenv("GITHUB_REPO_NAME", "")
 GITHUB_ISSUE_LABEL: str = os.getenv("GITHUB_ISSUE_LABEL", "devin-backlog")
 
 DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
+DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
+DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +469,94 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
         )
 
 
+def poll_session_status(
+    api_key: str,
+    session_id: str,
+    interval: int = DEVIN_POLL_INTERVAL,
+    timeout: int = DEVIN_POLL_TIMEOUT,
+) -> dict[str, Any]:
+    """Poll the Devin session endpoint until the session reaches a terminal state.
+
+    Terminal states: ``finished``, ``stopped``, ``failed``.
+    Non-terminal states: ``queued``, ``started``, ``running``.
+
+    Args:
+        api_key: Devin API bearer token.
+        session_id: The session ID to poll.
+        interval: Seconds between polls.
+        timeout: Maximum total seconds to wait before giving up.
+
+    Returns:
+        The last status response dict, which includes at minimum
+        ``status`` and may include ``pull_request_url``.
+    """
+    url = f"{DEVIN_API_URL}/{session_id}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    terminal_states = {"finished", "stopped", "failed"}
+    elapsed = 0
+    last_status = "unknown"
+    status_data: dict[str, Any] = {}
+
+    logger.info(
+        "Polling session %s (every %ds, timeout %ds)...",
+        session_id,
+        interval,
+        timeout,
+    )
+
+    while elapsed < timeout:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.raise_for_status()
+            status_data = resp.json()
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Poll request failed: %s. Retrying...", exc)
+            time.sleep(interval)
+            elapsed += interval
+            continue
+
+        current_status = status_data.get(
+            "status_enum", status_data.get("status", "unknown")
+        )
+
+        if current_status != last_status:
+            _print_status_update(session_id, current_status, status_data)
+            last_status = current_status
+
+        if current_status in terminal_states:
+            logger.info(
+                "Session %s reached terminal state: %s", session_id, current_status
+            )
+            return status_data
+
+        time.sleep(interval)
+        elapsed += interval
+
+    logger.warning("Polling timed out after %ds for session %s.", timeout, session_id)
+    status_data["status"] = status_data.get("status", "timeout")
+    return status_data
+
+
+def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> None:
+    """Print a formatted status transition to the terminal."""
+    status_icons = {
+        "queued": "\U0001f4e5",  # inbox tray
+        "started": "\U0001f680",  # rocket
+        "running": "\U0001f6e0",  # wrench
+        "finished": "\u2705",  # check mark
+        "stopped": "\u23f9\ufe0f",  # stop button
+        "failed": "\u274c",  # cross mark
+    }
+    icon = status_icons.get(status, "\U0001f504")  # default: arrows
+    ts = datetime.now(tz=timezone.utc).strftime("%H:%M:%S UTC")
+    pr_url = data.get("pull_request_url", "")
+    pr_note = f"  PR: {pr_url}" if pr_url else ""
+    print(f"  {icon} [{ts}] Session {session_id[:12]}... -> {status.upper()}{pr_note}")
+
+
 # ---------------------------------------------------------------------------
 # Phase 4 -- Communication (mock Slack notification)
 # ---------------------------------------------------------------------------
@@ -633,7 +724,44 @@ def main() -> None:
             print(f"    - Issue #{f['issue_number']}: {f['error']}")
     print("=" * 80 + "\n")
 
+    # 5. Session status polling (optional)
+    if successes:
+        _offer_session_polling(successes, DEVIN_API_KEY)
+
     logger.info("Pipeline complete. %d session(s) created.", len(successes))
+
+
+def _offer_session_polling(successes: list[dict[str, Any]], api_key: str) -> None:
+    """Ask the operator whether to poll Devin session statuses."""
+    choice = (
+        input("Would you like to monitor session progress in real-time? (y/N): ")
+        .strip()
+        .lower()
+    )
+    if choice not in ("y", "yes"):
+        logger.info("Skipping session polling.")
+        return
+
+    print("\n" + "-" * 80)
+    print("  REAL-TIME SESSION MONITORING")
+    print(
+        f"  Polling every {DEVIN_POLL_INTERVAL}s "
+        f"(timeout {DEVIN_POLL_TIMEOUT}s per session)"
+    )
+    print("-" * 80)
+
+    for result in successes:
+        sid = result["session_id"]
+        issue_num = result["issue_number"]
+        print(f"\n  --- Issue #{issue_num} (session {sid[:12]}...) ---")
+        final = poll_session_status(api_key, sid)
+        final_status = final.get("status_enum", final.get("status", "unknown"))
+        pr_url = final.get("pull_request_url", "N/A")
+        print(f"  Final status: {final_status.upper()}  |  PR: {pr_url}")
+
+    print("\n" + "-" * 80)
+    print("  Monitoring complete.")
+    print("-" * 80 + "\n")
 
 
 if __name__ == "__main__":
