@@ -190,11 +190,43 @@ def mock_llm_evaluate(issue: Issue) -> dict[str, Any]:
     }
 
 
+def _evaluate_all_issues(
+    issues: list[Issue],
+) -> list[tuple[Issue, dict[str, Any]]]:
+    """Evaluate all issues and return (issue, scores) pairs sorted by score descending."""
+    evaluated: list[tuple[Issue, dict[str, Any]]] = []
+    for issue in issues:
+        scores = mock_llm_evaluate(issue)
+        evaluated.append((issue, scores))
+    # Sort by complexity_score descending (highest priority first)
+    evaluated.sort(key=lambda pair: pair[1]["complexity_score"], reverse=True)
+    return evaluated
+
+
+def prompt_complexity_filter() -> str | None:
+    """Ask the operator whether to filter the triage report by complexity.
+
+    Returns:
+        A complexity level string ("Low", "Medium", "High") to filter by,
+        or ``None`` to show all issues.
+    """
+    print(
+        "\nFilter by complexity? Enter one of: Low, Medium, High "
+        "(or press Enter to show all)"
+    )
+    choice = input("  Filter: ").strip().capitalize()
+    if choice in ("Low", "Medium", "High"):
+        logger.info("Applying complexity filter: %s", choice)
+        return choice
+    return None
+
+
 def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
     """Print a formatted triage report and return a lookup dict.
 
-    The report now includes staleness, age, and the raw complexity score
-    alongside the categorical labels, giving the operator more signal.
+    Issues are **sorted by complexity score** (highest first) so the
+    operator immediately sees the most impactful work.  An optional
+    complexity filter is offered before printing.
 
     Args:
         issues: List of GitHub issues to report on.
@@ -202,9 +234,27 @@ def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
     Returns:
         A mapping of issue number -> Issue for quick lookup.
     """
+    evaluated = _evaluate_all_issues(issues)
+
+    # Offer optional complexity filter
+    complexity_filter = prompt_complexity_filter()
+    if complexity_filter is not None:
+        evaluated = [
+            (iss, sc) for iss, sc in evaluated if sc["complexity"] == complexity_filter
+        ]
+        if not evaluated:
+            print(
+                f"  No issues matched complexity '{complexity_filter}'. "
+                "Showing all issues instead."
+            )
+            evaluated = _evaluate_all_issues(issues)
+
     separator = "=" * 96
     print(f"\n{separator}")
     print("  FINSERV CO  --  AUTOMATED ISSUE TRIAGE REPORT")
+    if complexity_filter:
+        print(f"  (Filtered: {complexity_filter} complexity only)")
+    print("  Sorted by complexity score (highest first)")
     print(separator)
     print(
         f"{'#':<8} {'Complexity':<12} {'Score':<7} {'Confidence':<12} "
@@ -213,8 +263,7 @@ def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
     print("-" * 96)
 
     lookup: dict[int, Issue] = {}
-    for issue in issues:
-        scores = mock_llm_evaluate(issue)
+    for issue, scores in evaluated:
         age_str = f"{scores['age_days']}d"
         print(
             f"#{issue.number:<7} {scores['complexity']:<12} "
@@ -227,7 +276,8 @@ def print_triage_report(issues: list[Issue]) -> dict[int, Issue]:
 
     print(separator)
     print(
-        "  Signals: body length, label count, comment count, issue age. "
+        f"  {len(evaluated)} issue(s) shown. "
+        "Signals: body length, label count, comment count, issue age. "
         "Score range 0-100."
     )
     print(separator + "\n")
