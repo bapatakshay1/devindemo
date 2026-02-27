@@ -25,6 +25,24 @@ from dotenv import load_dotenv
 from github import Github
 from github.Issue import Issue
 
+from errors import (
+    ERR_DEVIN_API_HTTP,
+    ERR_DEVIN_API_UNREACHABLE,
+    ERR_ENV_MISSING,
+    ERR_GITHUB_COMMENT_FAILED,
+    ERR_GITHUB_REPO_ACCESS,
+    ERR_INVALID_INPUT,
+    ERR_ISSUE_NOT_FOUND,
+    ConfigurationError,
+    DevinAPIError,
+    GitHubAccessError,
+    GitHubCommentError,
+    InvalidInputError,
+    IssueNotFoundError,
+    TriageError,
+    make_error,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration & Logging
 # ---------------------------------------------------------------------------
@@ -49,7 +67,11 @@ DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
 
 
 def _validate_env() -> None:
-    """Ensure all required environment variables are set."""
+    """Ensure all required environment variables are set.
+
+    Raises:
+        ConfigurationError: If any required environment variables are missing.
+    """
     missing: list[str] = []
     if not GITHUB_TOKEN:
         missing.append("GITHUB_TOKEN")
@@ -58,8 +80,14 @@ def _validate_env() -> None:
     if not GITHUB_REPO_NAME:
         missing.append("GITHUB_REPO_NAME")
     if missing:
-        logger.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+        err = make_error(
+            error_code=ERR_ENV_MISSING,
+            message=f"Missing required environment variables: {', '.join(missing)}",
+            service="configuration",
+            details={"missing_variables": missing},
+        )
+        err.log()
+        raise ConfigurationError(err)
 
 
 def fetch_labelled_issues(
@@ -82,8 +110,14 @@ def fetch_labelled_issues(
     try:
         repo = gh.get_repo(repo_name)
     except Exception as exc:
-        logger.error("Failed to access repository '%s': %s", repo_name, exc)
-        sys.exit(1)
+        err = make_error(
+            error_code=ERR_GITHUB_REPO_ACCESS,
+            message=f"Failed to access repository '{repo_name}'",
+            service="github",
+            details={"repository": repo_name, "original_error": str(exc)},
+        )
+        err.log()
+        raise GitHubAccessError(err) from exc
 
     logger.info("Fetching open issues with label '%s'...", label)
     issues: list[Issue] = list(repo.get_issues(state="open", labels=[label]))
@@ -158,6 +192,10 @@ def prompt_user_selection(lookup: dict[int, Issue]) -> Issue | None:
 
     Returns:
         The selected :class:`Issue`, or ``None`` if the user quits.
+
+    Raises:
+        InvalidInputError: If the input cannot be parsed as a number.
+        IssueNotFoundError: If the selected issue is not in the triage report.
     """
     while True:
         choice = input(
@@ -171,11 +209,25 @@ def prompt_user_selection(lookup: dict[int, Issue]) -> Issue | None:
         try:
             issue_number = int(choice)
         except ValueError:
-            print(f"  Invalid input '{choice}'. Please enter a number or 'q'.")
+            err = make_error(
+                error_code=ERR_INVALID_INPUT,
+                message=f"Invalid input '{choice}'. Please enter a number or 'q'.",
+                service="user_input",
+                details={"raw_input": choice},
+            )
+            err.log(logging.WARNING)
+            print(f"  {err.message}")
             continue
 
         if issue_number not in lookup:
-            print(f"  Issue #{issue_number} is not in the triage report. Try again.")
+            err = make_error(
+                error_code=ERR_ISSUE_NOT_FOUND,
+                message=f"Issue #{issue_number} is not in the triage report. Try again.",
+                service="user_input",
+                details={"issue_number": issue_number, "available_issues": list(lookup.keys())},
+            )
+            err.log(logging.WARNING)
+            print(f"  {err.message}")
             continue
 
         return lookup[issue_number]
@@ -250,15 +302,25 @@ def create_devin_session(
         )
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
-        logger.error(
-            "Devin API returned HTTP %s: %s",
-            exc.response.status_code if exc.response is not None else "N/A",
-            exc.response.text if exc.response is not None else str(exc),
+        status = exc.response.status_code if exc.response is not None else "N/A"
+        body = exc.response.text if exc.response is not None else str(exc)
+        err = make_error(
+            error_code=ERR_DEVIN_API_HTTP,
+            message=f"Devin API returned HTTP {status}",
+            service="devin_api",
+            details={"status_code": status, "response_body": body},
         )
-        sys.exit(1)
+        err.log()
+        raise DevinAPIError(err) from exc
     except requests.exceptions.RequestException as exc:
-        logger.error("Failed to reach Devin API: %s", exc)
-        sys.exit(1)
+        err = make_error(
+            error_code=ERR_DEVIN_API_UNREACHABLE,
+            message="Failed to reach Devin API",
+            service="devin_api",
+            details={"original_error": str(exc)},
+        )
+        err.log()
+        raise DevinAPIError(err) from exc
 
     data: dict[str, Any] = response.json()
     logger.info("Devin session created successfully.")
@@ -284,11 +346,13 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
         issue.create_comment(comment_body)
         logger.info("Posted automation comment on Issue #%d.", issue.number)
     except Exception as exc:
-        logger.warning(
-            "Failed to post comment on Issue #%d: %s. Continuing anyway.",
-            issue.number,
-            exc,
+        err = make_error(
+            error_code=ERR_GITHUB_COMMENT_FAILED,
+            message=f"Failed to post comment on Issue #{issue.number}. Continuing anyway.",
+            service="github",
+            details={"issue_number": issue.number, "original_error": str(exc)},
         )
+        err.log(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -332,55 +396,65 @@ def main() -> None:
     """Run the full triage-and-resolve pipeline."""
     logger.info("Starting FinServ Co Issue Triage Pipeline")
 
-    # 0. Validate environment
-    _validate_env()
+    try:
+        # 0. Validate environment
+        _validate_env()
 
-    # 1. Automated Triage
-    issues = fetch_labelled_issues(GITHUB_TOKEN, GITHUB_REPO_NAME, GITHUB_ISSUE_LABEL)
-    if not issues:
-        logger.warning(
-            "No open issues found with label '%s' in %s. Nothing to triage.",
-            GITHUB_ISSUE_LABEL,
-            GITHUB_REPO_NAME,
+        # 1. Automated Triage
+        issues = fetch_labelled_issues(
+            GITHUB_TOKEN, GITHUB_REPO_NAME, GITHUB_ISSUE_LABEL
         )
-        sys.exit(0)
+        if not issues:
+            logger.warning(
+                "No open issues found with label '%s' in %s. Nothing to triage.",
+                GITHUB_ISSUE_LABEL,
+                GITHUB_REPO_NAME,
+            )
+            sys.exit(0)
 
-    lookup = print_triage_report(issues)
+        lookup = print_triage_report(issues)
 
-    # 2. Human-in-the-Loop
-    selected_issue = prompt_user_selection(lookup)
-    if selected_issue is None:
-        sys.exit(0)
+        # 2. Human-in-the-Loop
+        selected_issue = prompt_user_selection(lookup)
+        if selected_issue is None:
+            sys.exit(0)
 
-    logger.info(
-        "User selected Issue #%d: %s",
-        selected_issue.number,
-        selected_issue.title,
-    )
+        logger.info(
+            "User selected Issue #%d: %s",
+            selected_issue.number,
+            selected_issue.title,
+        )
 
-    # 3. Devin API Execution
-    prompt = build_devin_prompt(selected_issue, GITHUB_REPO_NAME)
-    logger.debug("Devin prompt:\n%s", prompt)
+        # 3. Devin API Execution
+        prompt = build_devin_prompt(selected_issue, GITHUB_REPO_NAME)
+        logger.debug("Devin prompt:\n%s", prompt)
 
-    response_data = create_devin_session(DEVIN_API_KEY, prompt)
+        response_data = create_devin_session(DEVIN_API_KEY, prompt)
 
-    session_id = response_data.get("session_id", "unknown")
-    session_url = response_data.get(
-        "url", f"https://app.devin.ai/sessions/{session_id}"
-    )
+        session_id = response_data.get("session_id", "unknown")
+        session_url = response_data.get(
+            "url", f"https://app.devin.ai/sessions/{session_id}"
+        )
 
-    logger.info("Devin Session ID : %s", session_id)
-    logger.info("Devin Session URL: %s", session_url)
+        logger.info("Devin Session ID : %s", session_id)
+        logger.info("Devin Session URL: %s", session_url)
 
-    # 3b. Post a comment on the GitHub issue
-    post_github_comment(selected_issue, session_url)
+        # 3b. Post a comment on the GitHub issue
+        post_github_comment(selected_issue, session_url)
 
-    # 4. Communication
-    send_slack_notification(selected_issue.number, session_url)
+        # 4. Communication
+        send_slack_notification(selected_issue.number, session_url)
 
-    logger.info(
-        "Pipeline complete. Devin is now working on Issue #%d.", selected_issue.number
-    )
+        logger.info(
+            "Pipeline complete. Devin is now working on Issue #%d.",
+            selected_issue.number,
+        )
+
+    except TriageError as exc:
+        # All custom errors already logged at their raise site;
+        # print the structured JSON for operators / downstream consumers.
+        print(exc.error_response.to_json(), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
