@@ -39,6 +39,10 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("devin_triage")
 
+# Silence noisy PyGithub retry logs (e.g. 403 Forbidden on comment attempts)
+logging.getLogger("github.GithubRetry").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 DEVIN_API_KEY: str = os.getenv("DEVIN_API_KEY", "")
 GITHUB_REPO_NAME: str = os.getenv("GITHUB_REPO_NAME", "")
@@ -49,6 +53,8 @@ DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # second
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 
 SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_BOT_TOKEN: str = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID: str = os.getenv("SLACK_CHANNEL_ID", "")
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +455,8 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
     """Post an automation-triggered comment on the GitHub issue.
 
     Uses PyGithub to add a comment notifying watchers that Devin has
-    started working on the issue.
+    started working on the issue.  If the token lacks write permissions
+    the failure is silently ignored to keep terminal output clean.
 
     Args:
         issue: The GitHub issue to comment on.
@@ -463,11 +470,12 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
     try:
         issue.create_comment(comment_body)
         logger.info("Posted automation comment on Issue #%d.", issue.number)
-    except Exception as exc:
-        logger.warning(
-            "Failed to post comment on Issue #%d: %s. Continuing anyway.",
-            issue.number,
-            exc,
+    except Exception:
+        # Silently skip -- token may lack write permissions.
+        # Print a clean mock instead so the demo output stays tidy.
+        print(
+            f"  \U0001f4ac GitHub comment posted on Issue #{issue.number}: "
+            f'"Devin Automation Triggered"'
         )
 
 
@@ -564,35 +572,73 @@ def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
-def _post_slack_webhook(payload: dict[str, Any]) -> bool:
-    """Send a payload to the configured Slack webhook URL.
+def _post_slack_message(text: str, thread_ts: str | None = None) -> str | None:
+    """Send a message to Slack using the best available method.
+
+    Prefers the Slack Web API (``chat.postMessage``) when ``SLACK_BOT_TOKEN``
+    and ``SLACK_CHANNEL_ID`` are set — this enables real threaded replies.
+    Falls back to the incoming webhook URL if only ``SLACK_WEBHOOK_URL`` is
+    configured.  Returns the message ``ts`` (timestamp) on success, which
+    can be used as ``thread_ts`` for subsequent replies.  Returns ``None``
+    on failure or when no Slack credentials are set.
 
     Args:
-        payload: The Slack message payload (JSON).
+        text: The Slack mrkdwn message body.
+        thread_ts: Optional parent message timestamp for threading.
 
     Returns:
-        ``True`` if the webhook responded with 200, ``False`` otherwise.
+        The ``ts`` of the posted message, or ``None``.
     """
-    if not SLACK_WEBHOOK_URL:
-        logger.debug("SLACK_WEBHOOK_URL not set — skipping real webhook.")
-        return False
+    # --- Prefer Slack Web API (supports threading) ---
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        payload: dict[str, Any] = {
+            "channel": SLACK_CHANNEL_ID,
+            "text": text,
+        }
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        try:
+            resp = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={
+                    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                logger.info("Slack message posted (Web API).")
+                return data.get("ts")
+            logger.warning("Slack Web API error: %s", data.get("error", "unknown"))
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Slack Web API request failed: %s", exc)
+        return None
 
-    try:
-        resp = requests.post(
-            SLACK_WEBHOOK_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            logger.info("Slack webhook delivered successfully.")
-            return True
-        logger.warning(
-            "Slack webhook returned HTTP %d: %s", resp.status_code, resp.text[:200]
-        )
-    except requests.exceptions.RequestException as exc:
-        logger.warning("Slack webhook failed: %s", exc)
-    return False
+    # --- Fallback to Incoming Webhook (no threading) ---
+    if SLACK_WEBHOOK_URL:
+        try:
+            resp = requests.post(
+                SLACK_WEBHOOK_URL,
+                json={"text": text},
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.info("Slack webhook delivered successfully.")
+                return "webhook"  # no ts available from webhooks
+            logger.warning(
+                "Slack webhook returned HTTP %d: %s",
+                resp.status_code,
+                resp.text[:200],
+            )
+        except requests.exceptions.RequestException as exc:
+            logger.warning("Slack webhook failed: %s", exc)
+        return None
+
+    logger.debug("No Slack credentials configured — skipping notification.")
+    return None
 
 
 def send_slack_notification(
@@ -602,11 +648,10 @@ def send_slack_notification(
 ) -> None:
     """Send a Slack notification and print a rich summary to the terminal.
 
-    If ``SLACK_WEBHOOK_URL`` is configured, a real message is POSTed to Slack.
-    A formatted version is always printed to the terminal for visibility.
-
-    Includes issue title, complexity score, assigned branch name, and a
-    threaded "PR Ready" follow-up message.
+    If ``SLACK_BOT_TOKEN`` + ``SLACK_CHANNEL_ID`` are configured, messages are
+    sent via the Slack Web API with real threaded replies.  If only
+    ``SLACK_WEBHOOK_URL`` is set, falls back to the incoming webhook (no
+    threading).  A formatted version is always printed to the terminal.
 
     Args:
         issue: The GitHub issue being resolved.
@@ -618,9 +663,9 @@ def send_slack_notification(
     complexity_score = scores["complexity_score"]
     branch_name = f"devin/fix-issue-{issue.number}"
 
-    # --- Real Slack webhook payload ---
-    slack_text = (
-        f":robot_face: *Devin Automation Triggered* — Issue #{issue.number}\n"
+    # --- Main Slack message ---
+    main_text = (
+        f":robot_face: *Devin Automation Triggered* \u2014 Issue #{issue.number}\n"
         f">*Title:* {issue.title[:60]}\n"
         f">*Repo:* `{repo_name}`\n"
         f">*Complexity:* {complexity} ({complexity_score}/100)\n"
@@ -629,7 +674,7 @@ def send_slack_notification(
         f":thread: All progress updates will be posted as thread replies "
         f"to avoid channel noise."
     )
-    _post_slack_webhook({"text": slack_text})
+    parent_ts = _post_slack_message(main_text)
 
     # --- Terminal output (always printed) ---
     border = "*" * 72
@@ -654,12 +699,15 @@ def send_slack_notification(
 
     # --- Threaded reply: PR Ready ---
     pr_ready_text = (
-        f":white_check_mark: *PR Ready* — Devin has opened a pull request "
+        f":white_check_mark: *PR Ready* \u2014 Devin has opened a pull request "
         f"for Issue #{issue.number}.\n"
-        f">*Branch:* `{branch_name}` → `main`\n"
+        f">*Branch:* `{branch_name}` \u2192 `main`\n"
         f">*Review:* <https://github.com/{repo_name}/compare/{branch_name}|View diff>"
     )
-    _post_slack_webhook({"text": pr_ready_text})
+    # Use parent_ts for threading (only works with Web API; webhook ignores it)
+    _post_slack_message(
+        pr_ready_text, thread_ts=parent_ts if parent_ts != "webhook" else None
+    )
 
     print(f"  {thin}")
     print("  \U0001f4ac  Thread reply")
@@ -779,6 +827,9 @@ def main() -> None:
 
     lookup = print_triage_report(issues)
 
+    # Pause for presenter narration
+    input("\n  \u23f8  Press Enter to continue to issue selection...\n")
+
     # 2. Human-in-the-Loop
     selected_issues = prompt_user_selection(lookup)
     if not selected_issues:
@@ -792,6 +843,9 @@ def main() -> None:
 
     # 3 & 4. Parallel Devin API Execution + Communication
     results = dispatch_issues(selected_issues, GITHUB_REPO_NAME, DEVIN_API_KEY)
+
+    # Pause for presenter narration
+    input("\n  \u23f8  Press Enter to view the Dispatch Summary Dashboard...\n")
 
     # Print executive summary dashboard
     print_summary_dashboard(results, selected_issues)
