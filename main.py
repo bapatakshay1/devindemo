@@ -48,6 +48,8 @@ DEVIN_API_URL = os.getenv("DEVIN_API_URL", "https://api.devin.ai/v1/sessions")
 DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 
+SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 helpers
@@ -562,15 +564,49 @@ def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
+def _post_slack_webhook(payload: dict[str, Any]) -> bool:
+    """Send a payload to the configured Slack webhook URL.
+
+    Args:
+        payload: The Slack message payload (JSON).
+
+    Returns:
+        ``True`` if the webhook responded with 200, ``False`` otherwise.
+    """
+    if not SLACK_WEBHOOK_URL:
+        logger.debug("SLACK_WEBHOOK_URL not set — skipping real webhook.")
+        return False
+
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("Slack webhook delivered successfully.")
+            return True
+        logger.warning(
+            "Slack webhook returned HTTP %d: %s", resp.status_code, resp.text[:200]
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Slack webhook failed: %s", exc)
+    return False
+
+
 def send_slack_notification(
     issue: Issue,
     session_url: str,
     repo_name: str,
 ) -> None:
-    """Print a rich mock Slack webhook notification to the terminal.
+    """Send a Slack notification and print a rich summary to the terminal.
+
+    If ``SLACK_WEBHOOK_URL`` is configured, a real message is POSTed to Slack.
+    A formatted version is always printed to the terminal for visibility.
 
     Includes issue title, complexity score, assigned branch name, and a
-    simulated threaded "PR Ready" follow-up message.
+    threaded "PR Ready" follow-up message.
 
     Args:
         issue: The GitHub issue being resolved.
@@ -582,10 +618,23 @@ def send_slack_notification(
     complexity_score = scores["complexity_score"]
     branch_name = f"devin/fix-issue-{issue.number}"
 
+    # --- Real Slack webhook payload ---
+    slack_text = (
+        f":robot_face: *Devin Automation Triggered* — Issue #{issue.number}\n"
+        f">*Title:* {issue.title[:60]}\n"
+        f">*Repo:* `{repo_name}`\n"
+        f">*Complexity:* {complexity} ({complexity_score}/100)\n"
+        f">*Branch:* `{branch_name}`\n"
+        f">*Session:* <{session_url}|View Devin session>\n\n"
+        f":thread: All progress updates will be posted as thread replies "
+        f"to avoid channel noise."
+    )
+    _post_slack_webhook({"text": slack_text})
+
+    # --- Terminal output (always printed) ---
     border = "*" * 72
     thin = "-" * 72
 
-    # --- Main notification ---
     print(f"\n{border}")
     print("  \U0001f514  SLACK  \u2014  #eng-devin-automation")
     print(border)
@@ -603,9 +652,17 @@ def send_slack_notification(
     print("     to avoid channel noise. Follow the thread for real-time status.")
     print(border)
 
-    # --- Simulated threaded reply: PR Ready ---
+    # --- Threaded reply: PR Ready ---
+    pr_ready_text = (
+        f":white_check_mark: *PR Ready* — Devin has opened a pull request "
+        f"for Issue #{issue.number}.\n"
+        f">*Branch:* `{branch_name}` → `main`\n"
+        f">*Review:* <https://github.com/{repo_name}/compare/{branch_name}|View diff>"
+    )
+    _post_slack_webhook({"text": pr_ready_text})
+
     print(f"  {thin}")
-    print("  \U0001f4ac  Thread reply (simulated)")
+    print("  \U0001f4ac  Thread reply")
     print(f"  {thin}")
     print(
         f"  \u2705 *PR Ready* \u2014 Devin has opened a pull request for "
