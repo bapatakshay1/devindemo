@@ -14,13 +14,13 @@ Phases:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import sys
 from typing import Any
 
 import requests
+from cryptography.hazmat.primitives import hashes
 from dotenv import load_dotenv
 from github import Github
 from github.Issue import Issue
@@ -105,7 +105,9 @@ def mock_llm_evaluate(title: str, body: str) -> dict[str, Any]:
         A dict with ``complexity`` (Low / Medium / High) and
         ``confidence`` (int percentage 50-99).
     """
-    digest = hashlib.sha256(f"{title}:{body}".encode()).hexdigest()
+    h = hashes.Hash(hashes.SHA256())
+    h.update(f"{title}:{body}".encode())
+    digest = h.finalize().hex()
     hash_int = int(digest[:8], 16)
 
     complexity_levels = ["Low", "Medium", "High"]
