@@ -611,10 +611,14 @@ def _post_slack_message(text: str, thread_ts: str | None = None) -> str | None:
             if data.get("ok"):
                 logger.info("Slack message posted (Web API).")
                 return data.get("ts")
-            logger.warning("Slack Web API error: %s", data.get("error", "unknown"))
+            logger.warning(
+                "Slack Web API error: %s — falling back to webhook.",
+                data.get("error", "unknown"),
+            )
         except requests.exceptions.RequestException as exc:
-            logger.warning("Slack Web API request failed: %s", exc)
-        return None
+            logger.warning(
+                "Slack Web API request failed: %s — falling back to webhook.", exc
+            )
 
     # --- Fallback to Incoming Webhook (no threading) ---
     if SLACK_WEBHOOK_URL:
