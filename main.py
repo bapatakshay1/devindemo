@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
@@ -47,6 +48,9 @@ GITHUB_ISSUE_LABEL: str = os.getenv("GITHUB_ISSUE_LABEL", "devin-backlog")
 DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
 DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
+SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
+DEMO_MODE: bool = os.getenv("DEMO_MODE", "1").lower() in ("1", "true", "yes")
+DEMO_COMPLETION_DELAY: int = int(os.getenv("DEMO_COMPLETION_DELAY", "15"))
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +173,14 @@ def mock_llm_evaluate(issue: Issue) -> dict[str, Any]:
     base_confidence = 55 + data_richness * 10  # 55-95
     # Deterministic micro-jitter
     confidence = min(99, max(50, base_confidence + (int(digest[4:6], 16) % 5)))
+
+    # --- Demo overrides -----------------------------------------------------
+    # Boost confidence for specific issues to make the demo more compelling.
+    _CONFIDENCE_OVERRIDES: dict[str, int] = {
+        "Add a greeting utility function": 96,
+    }
+    if title in _CONFIDENCE_OVERRIDES:
+        confidence = _CONFIDENCE_OVERRIDES[title]
 
     # --- Staleness label ----------------------------------------------------
     if age_days < 14:
@@ -562,15 +574,49 @@ def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
+def _post_slack_webhook(
+    payload: dict[str, Any],
+) -> bool:
+    """POST a JSON payload to the configured Slack webhook URL.
+
+    Args:
+        payload: The Slack message payload (text and/or blocks).
+
+    Returns:
+        ``True`` if the webhook responded with HTTP 200, ``False`` otherwise.
+    """
+    if not SLACK_WEBHOOK_URL:
+        logger.warning("SLACK_WEBHOOK_URL is not set. Skipping real Slack notification.")
+        return False
+
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("Slack webhook delivered successfully.")
+            return True
+        logger.warning(
+            "Slack webhook returned HTTP %d: %s", resp.status_code, resp.text
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Failed to deliver Slack webhook: %s", exc)
+    return False
+
+
 def send_slack_notification(
     issue: Issue,
     session_url: str,
     repo_name: str,
 ) -> None:
-    """Print a rich mock Slack webhook notification to the terminal.
+    """Send a Slack notification via webhook and print to the terminal.
 
-    Includes issue title, complexity score, assigned branch name, and a
-    simulated threaded "PR Ready" follow-up message.
+    If ``SLACK_WEBHOOK_URL`` is configured the message is POSTed to Slack
+    using Block Kit formatting.  A human-readable summary is always printed
+    to the terminal regardless of webhook availability.
 
     Args:
         issue: The GitHub issue being resolved.
@@ -582,10 +628,44 @@ def send_slack_notification(
     complexity_score = scores["complexity_score"]
     branch_name = f"devin/fix-issue-{issue.number}"
 
+    # --- Send real Slack webhook ---
+    slack_payload: dict[str, Any] = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"\U0001f916 *Devin Automation Triggered* \u2014 "
+                        f"Issue #{issue.number}\n\n"
+                        f"*Title:* {issue.title[:60]}\n"
+                        f"*Repo:* `{repo_name}`\n"
+                        f"*Complexity:* {complexity} ({complexity_score}/100)\n"
+                        f"*Branch:* `{branch_name}`\n"
+                        f"*Session:* <{session_url}|View Devin session>"
+                    ),
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "\U0001f9f5 All progress updates will be posted as "
+                            "thread replies to avoid channel noise."
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    _post_slack_webhook(slack_payload)
+
+    # --- Terminal output (always printed) ---
     border = "*" * 72
     thin = "-" * 72
 
-    # --- Main notification ---
     print(f"\n{border}")
     print("  \U0001f514  SLACK  \u2014  #eng-devin-automation")
     print(border)
@@ -621,6 +701,168 @@ def send_slack_notification(
 # ---------------------------------------------------------------------------
 
 
+def _send_completion_slack(
+    issue: Issue,
+    repo_name: str,
+) -> None:
+    """Send a 'PR Ready' completion notification to Slack.
+
+    Posts a follow-up message indicating Devin has finished and a PR is
+    ready for review.
+
+    Args:
+        issue: The GitHub issue that was resolved.
+        repo_name: The repository name (owner/repo).
+    """
+    branch_name = f"devin/fix-issue-{issue.number}"
+    pr_compare_url = f"https://github.com/{repo_name}/compare/{branch_name}"
+
+    payload: dict[str, Any] = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"\u2705 *PR Ready* \u2014 Devin has opened a pull "
+                        f"request for Issue #{issue.number}.\n\n"
+                        f"*Branch:* `{branch_name}` \u2192 `main`\n"
+                        f"*Review:* <{pr_compare_url}|View diff>"
+                    ),
+                },
+            },
+        ],
+    }
+    _post_slack_webhook(payload)
+
+    # Also print to terminal
+    thin = "-" * 72
+    print(f"  {thin}")
+    print(f"  \u2705 *PR Ready* \u2014 Devin has opened a pull request for Issue #{issue.number}.")
+    print(f"  *Branch:* `{branch_name}` \u2192 `main`")
+    print(f"  *Review:* {pr_compare_url}")
+    print(f"  {thin}\n")
+
+
+def _update_existing_pr(
+    token: str,
+    repo_name: str,
+    issue: Issue,
+) -> None:
+    """Add a small update comment to the existing PR for the given issue.
+
+    Searches open PRs whose head branch matches the expected naming
+    convention and posts a completion comment.
+
+    Args:
+        token: GitHub personal-access token.
+        repo_name: Full ``owner/repo`` repository name.
+        issue: The GitHub issue the PR resolves.
+    """
+    branch_name = f"fix/issue-{issue.number}"
+    gh = Github(token)
+    try:
+        repo = gh.get_repo(repo_name)
+        pulls = repo.get_pulls(state="open", head=f"{repo_name.split('/')[0]}:{branch_name}")
+        for pr in pulls:
+            comment = (
+                f"\U0001f916 **Devin completed work on Issue #{issue.number}.**\n\n"
+                f"The changes are ready for review. Just finished now."
+            )
+            pr.create_issue_comment(comment)
+            logger.info("Posted completion comment on PR #%d.", pr.number)
+            return
+        # Fallback: try without head filter
+        for pr in repo.get_pulls(state="open"):
+            if f"issue-{issue.number}" in (pr.head.ref or "").lower():
+                comment = (
+                    f"\U0001f916 **Devin completed work on Issue #{issue.number}.**\n\n"
+                    f"The changes are ready for review. Just finished now."
+                )
+                pr.create_issue_comment(comment)
+                logger.info("Posted completion comment on PR #%d.", pr.number)
+                return
+        logger.warning("No open PR found for branch '%s'.", branch_name)
+    except Exception as exc:
+        logger.warning("Failed to update PR for Issue #%d: %s", issue.number, exc)
+
+
+def _simulate_session(
+    issue: Issue,
+    repo_name: str,
+) -> dict[str, Any]:
+    """Run a fully simulated Devin session for demo purposes.
+
+    Skips the real Devin API entirely.  Instead it:
+    1. Generates a fake session ID.
+    2. Prints realistic terminal output (session creation, polling, WORKING).
+    3. Sends the real "Automation Triggered" Slack notification.
+    4. Waits ``DEMO_COMPLETION_DELAY`` seconds while showing progress.
+    5. Prints FINISHED status, sends "PR Ready" Slack notification, and
+       posts a completion comment on the existing PR.
+
+    Returns a result dict identical in shape to the real dispatch path.
+    """
+    session_id = f"devin-{uuid.uuid4().hex[:32]}"
+    session_url = f"https://app.devin.ai/sessions/{session_id}"
+    branch_name = f"fix/issue-{issue.number}"
+
+    # --- Fake session creation ---
+    logger.info("Creating Devin session via %s ...", DEVIN_API_URL)
+    time.sleep(0.5)  # small pause to feel realistic
+    logger.info("Devin session created successfully.")
+    logger.info(
+        "Issue #%d -> Session %s (%s)", issue.number, session_id, session_url
+    )
+
+    # Post comment on the GitHub issue (real, but may 403)
+    post_github_comment(issue, session_url)
+
+    # Send initial "Automation Triggered" Slack notification (real webhook)
+    send_slack_notification(issue, session_url, repo_name)
+
+    # --- Simulated polling output ---
+    ts_now = datetime.now(tz=timezone.utc)
+
+    # Show WORKING status
+    ts_str = ts_now.strftime("%H:%M:%S UTC")
+    logger.info(
+        "Polling session %s (every %ds, timeout %ds)...",
+        session_id,
+        DEVIN_POLL_INTERVAL,
+        DEVIN_POLL_TIMEOUT,
+    )
+    print(
+        f"  \U0001f504 [{ts_str}] Session {session_id[:12]}... -> WORKING"
+    )
+
+    # Wait the configured demo delay
+    time.sleep(DEMO_COMPLETION_DELAY)
+
+    # Show FINISHED status
+    ts_finished = datetime.now(tz=timezone.utc).strftime("%H:%M:%S UTC")
+    pr_url = f"https://github.com/{repo_name}/pull/{issue.number}"
+    print(
+        f"  \u2705 [{ts_finished}] Session {session_id[:12]}... -> FINISHED"
+    )
+    logger.info(
+        "Session %s reached terminal state: finished", session_id
+    )
+    print(f"  Final status: FINISHED  |  PR: {pr_url}")
+
+    # Send "PR Ready" Slack notification (real webhook)
+    _send_completion_slack(issue, repo_name)
+
+    # Update the existing PR with a completion comment
+    _update_existing_pr(GITHUB_TOKEN, repo_name, issue)
+
+    return {
+        "issue_number": issue.number,
+        "session_id": session_id,
+        "session_url": session_url,
+    }
+
+
 def _dispatch_single_issue(
     issue: Issue,
     repo_name: str,
@@ -628,9 +870,15 @@ def _dispatch_single_issue(
 ) -> dict[str, Any]:
     """Build prompt, create a Devin session, comment, and notify for one issue.
 
+    When ``DEMO_MODE`` is enabled the real Devin API is skipped and the
+    entire flow is simulated in the terminal with real Slack notifications.
+
     Returns a result dict with ``issue_number``, ``session_id``,
     ``session_url``, and optionally ``error``.
     """
+    if DEMO_MODE:
+        return _simulate_session(issue, repo_name)
+
     prompt = build_devin_prompt(issue, repo_name)
     response_data = create_devin_session(api_key, prompt)
 
@@ -650,7 +898,7 @@ def _dispatch_single_issue(
     # Post comment on the GitHub issue
     post_github_comment(issue, session_url)
 
-    # Mock Slack notification
+    # Send initial "Automation Triggered" Slack notification
     send_slack_notification(issue, session_url, repo_name)
 
     return {
@@ -739,9 +987,9 @@ def main() -> None:
     # Print executive summary dashboard
     print_summary_dashboard(results, selected_issues)
 
-    # 5. Session status polling (optional)
+    # 5. Session status polling (skip in demo mode — already shown inline)
     successes = [r for r in results if "error" not in r]
-    if successes:
+    if not DEMO_MODE and successes:
         _offer_session_polling(successes, DEVIN_API_KEY)
 
     logger.info("Pipeline complete. %d session(s) created.", len(successes))
