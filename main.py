@@ -25,6 +25,21 @@ from dotenv import load_dotenv
 from github import Github
 from github.Issue import Issue
 
+from errors import (
+    DEVIN_API_CONNECTION_ERROR,
+    DEVIN_API_HTTP_ERROR,
+    GITHUB_COMMENT_ERROR,
+    GITHUB_REPO_ERROR,
+    USER_INPUT_ERROR,
+    VALIDATION_ERROR,
+    ConfigurationError,
+    DevinAPIError,
+    GitHubServiceError,
+    UserInputError,
+    build_error_response,
+    handle_error,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration & Logging
 # ---------------------------------------------------------------------------
@@ -49,7 +64,11 @@ DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
 
 
 def _validate_env() -> None:
-    """Ensure all required environment variables are set."""
+    """Ensure all required environment variables are set.
+
+    Raises:
+        ConfigurationError: If any required variable is missing.
+    """
     missing: list[str] = []
     if not GITHUB_TOKEN:
         missing.append("GITHUB_TOKEN")
@@ -58,8 +77,13 @@ def _validate_env() -> None:
     if not GITHUB_REPO_NAME:
         missing.append("GITHUB_REPO_NAME")
     if missing:
-        logger.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+        err = build_error_response(
+            code=VALIDATION_ERROR,
+            message=f"Missing required environment variables: {', '.join(missing)}",
+            service="env_validator",
+            details={"missing_variables": missing},
+        )
+        raise ConfigurationError(err)
 
 
 def fetch_labelled_issues(
@@ -82,8 +106,13 @@ def fetch_labelled_issues(
     try:
         repo = gh.get_repo(repo_name)
     except Exception as exc:
-        logger.error("Failed to access repository '%s': %s", repo_name, exc)
-        sys.exit(1)
+        err = build_error_response(
+            code=GITHUB_REPO_ERROR,
+            message=f"Failed to access repository '{repo_name}'",
+            service="github_integration",
+            details={"repository": repo_name, "original_error": str(exc)},
+        )
+        raise GitHubServiceError(err) from exc
 
     logger.info("Fetching open issues with label '%s'...", label)
     issues: list[Issue] = list(repo.get_issues(state="open", labels=[label]))
@@ -171,11 +200,23 @@ def prompt_user_selection(lookup: dict[int, Issue]) -> Issue | None:
         try:
             issue_number = int(choice)
         except ValueError:
-            print(f"  Invalid input '{choice}'. Please enter a number or 'q'.")
+            err = build_error_response(
+                code=USER_INPUT_ERROR,
+                message=f"Invalid input '{choice}'. Please enter a number or 'q'.",
+                service="user_input",
+                details={"raw_input": choice},
+            )
+            handle_error(err, fatal=False)
             continue
 
         if issue_number not in lookup:
-            print(f"  Issue #{issue_number} is not in the triage report. Try again.")
+            err = build_error_response(
+                code=USER_INPUT_ERROR,
+                message=f"Issue #{issue_number} is not in the triage report. Try again.",
+                service="user_input",
+                details={"issue_number": issue_number},
+            )
+            handle_error(err, fatal=False)
             continue
 
         return lookup[issue_number]
@@ -232,7 +273,7 @@ def create_devin_session(
         The parsed JSON response from the API.
 
     Raises:
-        SystemExit: If the API call fails.
+        DevinAPIError: If the API call fails.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -250,15 +291,23 @@ def create_devin_session(
         )
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
-        logger.error(
-            "Devin API returned HTTP %s: %s",
-            exc.response.status_code if exc.response is not None else "N/A",
-            exc.response.text if exc.response is not None else str(exc),
+        status = exc.response.status_code if exc.response is not None else "N/A"
+        body = exc.response.text if exc.response is not None else str(exc)
+        err = build_error_response(
+            code=DEVIN_API_HTTP_ERROR,
+            message=f"Devin API returned HTTP {status}",
+            service="devin_api",
+            details={"status_code": status, "response_body": body},
         )
-        sys.exit(1)
+        raise DevinAPIError(err) from exc
     except requests.exceptions.RequestException as exc:
-        logger.error("Failed to reach Devin API: %s", exc)
-        sys.exit(1)
+        err = build_error_response(
+            code=DEVIN_API_CONNECTION_ERROR,
+            message="Failed to reach Devin API",
+            service="devin_api",
+            details={"original_error": str(exc)},
+        )
+        raise DevinAPIError(err) from exc
 
     data: dict[str, Any] = response.json()
     logger.info("Devin session created successfully.")
@@ -284,11 +333,16 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
         issue.create_comment(comment_body)
         logger.info("Posted automation comment on Issue #%d.", issue.number)
     except Exception as exc:
-        logger.warning(
-            "Failed to post comment on Issue #%d: %s. Continuing anyway.",
-            issue.number,
-            exc,
+        err = build_error_response(
+            code=GITHUB_COMMENT_ERROR,
+            message=f"Failed to post comment on Issue #{issue.number}",
+            service="github_integration",
+            details={
+                "issue_number": issue.number,
+                "original_error": str(exc),
+            },
         )
+        handle_error(err, fatal=False)
 
 
 # ---------------------------------------------------------------------------
@@ -329,9 +383,22 @@ def send_slack_notification(issue_number: int, session_url: str) -> None:
 
 
 def main() -> None:
-    """Run the full triage-and-resolve pipeline."""
+    """Run the full triage-and-resolve pipeline.
+
+    All pipeline errors are caught by a top-level handler so that every
+    failure is reported through the standardised :class:`ErrorResponse`
+    format before the process exits.
+    """
     logger.info("Starting FinServ Co Issue Triage Pipeline")
 
+    try:
+        _run_pipeline()
+    except (ConfigurationError, GitHubServiceError, DevinAPIError, UserInputError) as exc:
+        handle_error(exc.error_response, fatal=True)
+
+
+def _run_pipeline() -> None:
+    """Internal pipeline logic, separated for clean error propagation."""
     # 0. Validate environment
     _validate_env()
 
