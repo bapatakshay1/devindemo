@@ -47,6 +47,7 @@ GITHUB_ISSUE_LABEL: str = os.getenv("GITHUB_ISSUE_LABEL", "devin-backlog")
 DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
 DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
+SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
 
 
 # ---------------------------------------------------------------------------
@@ -562,15 +563,49 @@ def _print_status_update(session_id: str, status: str, data: dict[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
+def _post_slack_webhook(
+    payload: dict[str, Any],
+) -> bool:
+    """POST a JSON payload to the configured Slack webhook URL.
+
+    Args:
+        payload: The Slack message payload (text and/or blocks).
+
+    Returns:
+        ``True`` if the webhook responded with HTTP 200, ``False`` otherwise.
+    """
+    if not SLACK_WEBHOOK_URL:
+        logger.warning("SLACK_WEBHOOK_URL is not set. Skipping real Slack notification.")
+        return False
+
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("Slack webhook delivered successfully.")
+            return True
+        logger.warning(
+            "Slack webhook returned HTTP %d: %s", resp.status_code, resp.text
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Failed to deliver Slack webhook: %s", exc)
+    return False
+
+
 def send_slack_notification(
     issue: Issue,
     session_url: str,
     repo_name: str,
 ) -> None:
-    """Print a rich mock Slack webhook notification to the terminal.
+    """Send a Slack notification via webhook and print to the terminal.
 
-    Includes issue title, complexity score, assigned branch name, and a
-    simulated threaded "PR Ready" follow-up message.
+    If ``SLACK_WEBHOOK_URL`` is configured the message is POSTed to Slack
+    using Block Kit formatting.  A human-readable summary is always printed
+    to the terminal regardless of webhook availability.
 
     Args:
         issue: The GitHub issue being resolved.
@@ -582,10 +617,44 @@ def send_slack_notification(
     complexity_score = scores["complexity_score"]
     branch_name = f"devin/fix-issue-{issue.number}"
 
+    # --- Send real Slack webhook ---
+    slack_payload: dict[str, Any] = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"\U0001f916 *Devin Automation Triggered* \u2014 "
+                        f"Issue #{issue.number}\n\n"
+                        f"*Title:* {issue.title[:60]}\n"
+                        f"*Repo:* `{repo_name}`\n"
+                        f"*Complexity:* {complexity} ({complexity_score}/100)\n"
+                        f"*Branch:* `{branch_name}`\n"
+                        f"*Session:* <{session_url}|View Devin session>"
+                    ),
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "\U0001f9f5 All progress updates will be posted as "
+                            "thread replies to avoid channel noise."
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    _post_slack_webhook(slack_payload)
+
+    # --- Terminal output (always printed) ---
     border = "*" * 72
     thin = "-" * 72
 
-    # --- Main notification ---
     print(f"\n{border}")
     print("  \U0001f514  SLACK  \u2014  #eng-devin-automation")
     print(border)
