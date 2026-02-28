@@ -29,6 +29,27 @@ from dotenv import load_dotenv
 from github import Github
 from github.Issue import Issue
 
+from errors import (
+    ERR_DEVIN_API_HTTP,
+    ERR_DEVIN_API_UNREACHABLE,
+    ERR_DEVIN_POLL_FAILED,
+    ERR_DEVIN_POLL_TIMEOUT,
+    ERR_DISPATCH_FAILED,
+    ERR_GITHUB_COMMENT_FAILED,
+    ERR_GITHUB_REPO_ACCESS,
+    ERR_MISSING_ENV_VARS,
+    SERVICE_CONFIG,
+    SERVICE_DEVIN_API,
+    SERVICE_DISPATCH,
+    SERVICE_GITHUB,
+    ConfigurationError,
+    DevinAPIError,
+    ErrorResponse,
+    GitHubServiceError,
+    make_error,
+    make_warning,
+)
+
 # ---------------------------------------------------------------------------
 # Configuration & Logging
 # ---------------------------------------------------------------------------
@@ -55,7 +76,11 @@ DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 
 
 def _validate_env() -> None:
-    """Ensure all required environment variables are set."""
+    """Ensure all required environment variables are set.
+
+    Raises:
+        ConfigurationError: If any required variable is unset.
+    """
     missing: list[str] = []
     if not GITHUB_TOKEN:
         missing.append("GITHUB_TOKEN")
@@ -64,8 +89,13 @@ def _validate_env() -> None:
     if not GITHUB_REPO_NAME:
         missing.append("GITHUB_REPO_NAME")
     if missing:
-        logger.error("Missing required environment variables: %s", ", ".join(missing))
-        sys.exit(1)
+        err = make_error(
+            ERR_MISSING_ENV_VARS,
+            f"Missing required environment variables: {', '.join(missing)}",
+            SERVICE_CONFIG,
+            details={"missing_variables": missing},
+        )
+        raise ConfigurationError(err)
 
 
 def fetch_labelled_issues(
@@ -88,8 +118,13 @@ def fetch_labelled_issues(
     try:
         repo = gh.get_repo(repo_name)
     except Exception as exc:
-        logger.error("Failed to access repository '%s': %s", repo_name, exc)
-        sys.exit(1)
+        err = make_error(
+            ERR_GITHUB_REPO_ACCESS,
+            f"Failed to access repository '{repo_name}'",
+            SERVICE_GITHUB,
+            details={"repo_name": repo_name, "exception": str(exc)},
+        )
+        raise GitHubServiceError(err) from exc
 
     logger.info("Fetching open issues with label '%s'...", label)
     issues: list[Issue] = list(repo.get_issues(state="open", labels=[label]))
@@ -427,16 +462,23 @@ def create_devin_session(
         )
         response.raise_for_status()
     except requests.exceptions.HTTPError as exc:
-        msg = (
-            f"HTTP {exc.response.status_code}: {exc.response.text}"
-            if exc.response is not None
-            else str(exc)
+        status_code = exc.response.status_code if exc.response is not None else None
+        body = exc.response.text if exc.response is not None else str(exc)
+        err = make_error(
+            ERR_DEVIN_API_HTTP,
+            f"Devin API returned an HTTP error",
+            SERVICE_DEVIN_API,
+            details={"status_code": status_code, "response_body": body},
         )
-        logger.error("Devin API error: %s", msg)
-        return {"error": msg}
+        return err.to_dict()
     except requests.exceptions.RequestException as exc:
-        logger.error("Failed to reach Devin API: %s", exc)
-        return {"error": str(exc)}
+        err = make_error(
+            ERR_DEVIN_API_UNREACHABLE,
+            f"Failed to reach Devin API",
+            SERVICE_DEVIN_API,
+            details={"exception": str(exc)},
+        )
+        return err.to_dict()
 
     data: dict[str, Any] = response.json()
     logger.info("Devin session created successfully.")
@@ -462,10 +504,11 @@ def post_github_comment(issue: Issue, session_url: str) -> None:
         issue.create_comment(comment_body)
         logger.info("Posted automation comment on Issue #%d.", issue.number)
     except Exception as exc:
-        logger.warning(
-            "Failed to post comment on Issue #%d: %s. Continuing anyway.",
-            issue.number,
-            exc,
+        make_warning(
+            ERR_GITHUB_COMMENT_FAILED,
+            f"Failed to post comment on Issue #{issue.number}. Continuing anyway.",
+            SERVICE_GITHUB,
+            details={"issue_number": issue.number, "exception": str(exc)},
         )
 
 
@@ -513,7 +556,12 @@ def poll_session_status(
             resp.raise_for_status()
             status_data = resp.json()
         except requests.exceptions.RequestException as exc:
-            logger.warning("Poll request failed: %s. Retrying...", exc)
+            make_warning(
+                ERR_DEVIN_POLL_FAILED,
+                f"Poll request failed for session {session_id}. Retrying...",
+                SERVICE_DEVIN_API,
+                details={"session_id": session_id, "exception": str(exc)},
+            )
             time.sleep(interval)
             elapsed += interval
             continue
@@ -535,8 +583,14 @@ def poll_session_status(
         time.sleep(interval)
         elapsed += interval
 
-    logger.warning("Polling timed out after %ds for session %s.", timeout, session_id)
+    err = make_warning(
+        ERR_DEVIN_POLL_TIMEOUT,
+        f"Polling timed out after {timeout}s for session {session_id}",
+        SERVICE_DEVIN_API,
+        details={"session_id": session_id, "timeout": timeout, "elapsed": elapsed},
+    )
     status_data["status"] = status_data.get("status", "timeout")
+    status_data["poll_error"] = err.to_dict()
     return status_data
 
 
@@ -634,10 +688,11 @@ def _dispatch_single_issue(
     prompt = build_devin_prompt(issue, repo_name)
     response_data = create_devin_session(api_key, prompt)
 
-    if "error" in response_data:
+    if response_data.get("error"):
         return {
             "issue_number": issue.number,
-            "error": response_data["error"],
+            "error": response_data.get("message", response_data.get("error_code", "unknown")),
+            "error_response": response_data,
         }
 
     session_id = response_data.get("session_id", "unknown")
@@ -696,8 +751,17 @@ def dispatch_issues(
             try:
                 result = future.result()
             except Exception as exc:
-                logger.error("Dispatch failed for Issue #%d: %s", issue.number, exc)
-                result = {"issue_number": issue.number, "error": str(exc)}
+                err = make_error(
+                    ERR_DISPATCH_FAILED,
+                    f"Dispatch failed for Issue #{issue.number}",
+                    SERVICE_DISPATCH,
+                    details={"issue_number": issue.number, "exception": str(exc)},
+                )
+                result = {
+                    "issue_number": issue.number,
+                    "error": err.message,
+                    "error_response": err.to_dict(),
+                }
             results.append(result)
 
     return results
@@ -708,10 +772,21 @@ def main() -> None:
     logger.info("Starting FinServ Co Issue Triage Pipeline")
 
     # 0. Validate environment
-    _validate_env()
+    try:
+        _validate_env()
+    except ConfigurationError as exc:
+        print(f"Error: {exc.response.message}")
+        sys.exit(1)
 
     # 1. Automated Triage
-    issues = fetch_labelled_issues(GITHUB_TOKEN, GITHUB_REPO_NAME, GITHUB_ISSUE_LABEL)
+    try:
+        issues = fetch_labelled_issues(
+            GITHUB_TOKEN, GITHUB_REPO_NAME, GITHUB_ISSUE_LABEL
+        )
+    except GitHubServiceError as exc:
+        print(f"Error: {exc.response.message}")
+        sys.exit(1)
+
     if not issues:
         logger.warning(
             "No open issues found with label '%s' in %s. Nothing to triage.",
@@ -828,7 +903,11 @@ def print_summary_dashboard(
     if failures:
         print("\n  Failed dispatches:")
         for f in failures:
-            print(f"    - Issue #{f['issue_number']}: {f['error']}")
+            err_detail = f.get("error", "unknown")
+            err_resp = f.get("error_response")
+            err_code = err_resp.get("error_code", "") if err_resp else ""
+            prefix = f"[{err_code}] " if err_code else ""
+            print(f"    - Issue #{f['issue_number']}: {prefix}{err_detail}")
 
     print(f"\n{sep}\n")
 
