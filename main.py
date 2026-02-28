@@ -690,12 +690,105 @@ def send_slack_notification(
 # ---------------------------------------------------------------------------
 
 
+def _send_completion_slack(
+    issue: Issue,
+    repo_name: str,
+) -> None:
+    """Send a 'PR Ready' completion notification to Slack.
+
+    Posts a follow-up message indicating Devin has finished and a PR is
+    ready for review.
+
+    Args:
+        issue: The GitHub issue that was resolved.
+        repo_name: The repository name (owner/repo).
+    """
+    branch_name = f"devin/fix-issue-{issue.number}"
+    pr_compare_url = f"https://github.com/{repo_name}/compare/{branch_name}"
+
+    payload: dict[str, Any] = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"\u2705 *PR Ready* \u2014 Devin has opened a pull "
+                        f"request for Issue #{issue.number}.\n\n"
+                        f"*Branch:* `{branch_name}` \u2192 `main`\n"
+                        f"*Review:* <{pr_compare_url}|View diff>"
+                    ),
+                },
+            },
+        ],
+    }
+    _post_slack_webhook(payload)
+
+    # Also print to terminal
+    thin = "-" * 72
+    print(f"  {thin}")
+    print(f"  \u2705 *PR Ready* \u2014 Devin has opened a pull request for Issue #{issue.number}.")
+    print(f"  *Branch:* `{branch_name}` \u2192 `main`")
+    print(f"  *Review:* {pr_compare_url}")
+    print(f"  {thin}\n")
+
+
+def _update_existing_pr(
+    token: str,
+    repo_name: str,
+    issue: Issue,
+) -> None:
+    """Add a small update comment to the existing PR for the given issue.
+
+    Searches open PRs whose head branch matches the expected naming
+    convention and posts a completion comment.
+
+    Args:
+        token: GitHub personal-access token.
+        repo_name: Full ``owner/repo`` repository name.
+        issue: The GitHub issue the PR resolves.
+    """
+    branch_name = f"fix/issue-{issue.number}"
+    gh = Github(token)
+    try:
+        repo = gh.get_repo(repo_name)
+        pulls = repo.get_pulls(state="open", head=f"{repo_name.split('/')[0]}:{branch_name}")
+        for pr in pulls:
+            comment = (
+                f"\U0001f916 **Devin completed work on Issue #{issue.number}.**\n\n"
+                f"The changes are ready for review. Just finished now."
+            )
+            pr.create_issue_comment(comment)
+            logger.info("Posted completion comment on PR #%d.", pr.number)
+            return
+        # Fallback: try without head filter
+        for pr in repo.get_pulls(state="open"):
+            if f"issue-{issue.number}" in (pr.head.ref or "").lower():
+                comment = (
+                    f"\U0001f916 **Devin completed work on Issue #{issue.number}.**\n\n"
+                    f"The changes are ready for review. Just finished now."
+                )
+                pr.create_issue_comment(comment)
+                logger.info("Posted completion comment on PR #%d.", pr.number)
+                return
+        logger.warning("No open PR found for branch '%s'.", branch_name)
+    except Exception as exc:
+        logger.warning("Failed to update PR for Issue #%d: %s", issue.number, exc)
+
+
+# Simulated completion delay in seconds
+_DEMO_COMPLETION_DELAY: int = int(os.getenv("DEMO_COMPLETION_DELAY", "10"))
+
+
 def _dispatch_single_issue(
     issue: Issue,
     repo_name: str,
     api_key: str,
 ) -> dict[str, Any]:
     """Build prompt, create a Devin session, comment, and notify for one issue.
+
+    After the initial notification, waits a short delay and then sends a
+    completion notification to Slack and updates the existing PR on GitHub.
 
     Returns a result dict with ``issue_number``, ``session_id``,
     ``session_url``, and optionally ``error``.
@@ -719,8 +812,19 @@ def _dispatch_single_issue(
     # Post comment on the GitHub issue
     post_github_comment(issue, session_url)
 
-    # Mock Slack notification
+    # Send initial "Automation Triggered" Slack notification
     send_slack_notification(issue, session_url, repo_name)
+
+    # Simulate completion: wait, then send "PR Ready" and update the PR
+    logger.info(
+        "Simulating completion for Issue #%d in %ds...",
+        issue.number,
+        _DEMO_COMPLETION_DELAY,
+    )
+    time.sleep(_DEMO_COMPLETION_DELAY)
+
+    _send_completion_slack(issue, repo_name)
+    _update_existing_pr(GITHUB_TOKEN, repo_name, issue)
 
     return {
         "issue_number": issue.number,
