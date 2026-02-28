@@ -174,6 +174,14 @@ def mock_llm_evaluate(issue: Issue) -> dict[str, Any]:
     # Deterministic micro-jitter
     confidence = min(99, max(50, base_confidence + (int(digest[4:6], 16) % 5)))
 
+    # --- Demo overrides -----------------------------------------------------
+    # Boost confidence for specific issues to make the demo more compelling.
+    _CONFIDENCE_OVERRIDES: dict[str, int] = {
+        "Add a greeting utility function": 96,
+    }
+    if title in _CONFIDENCE_OVERRIDES:
+        confidence = _CONFIDENCE_OVERRIDES[title]
+
     # --- Staleness label ----------------------------------------------------
     if age_days < 14:
         staleness = "Fresh"
