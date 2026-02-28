@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
@@ -48,6 +49,8 @@ DEVIN_API_URL = "https://api.devin.ai/v3/sessions"
 DEVIN_POLL_INTERVAL: int = int(os.getenv("DEVIN_POLL_INTERVAL", "30"))  # seconds
 DEVIN_POLL_TIMEOUT: int = int(os.getenv("DEVIN_POLL_TIMEOUT", "600"))  # seconds
 SLACK_WEBHOOK_URL: str = os.getenv("SLACK_WEBHOOK_URL", "")
+DEMO_MODE: bool = os.getenv("DEMO_MODE", "1").lower() in ("1", "true", "yes")
+DEMO_COMPLETION_DELAY: int = int(os.getenv("DEMO_COMPLETION_DELAY", "15"))
 
 
 # ---------------------------------------------------------------------------
@@ -776,8 +779,80 @@ def _update_existing_pr(
         logger.warning("Failed to update PR for Issue #%d: %s", issue.number, exc)
 
 
-# Simulated completion delay in seconds
-_DEMO_COMPLETION_DELAY: int = int(os.getenv("DEMO_COMPLETION_DELAY", "10"))
+def _simulate_session(
+    issue: Issue,
+    repo_name: str,
+) -> dict[str, Any]:
+    """Run a fully simulated Devin session for demo purposes.
+
+    Skips the real Devin API entirely.  Instead it:
+    1. Generates a fake session ID.
+    2. Prints realistic terminal output (session creation, polling, WORKING).
+    3. Sends the real "Automation Triggered" Slack notification.
+    4. Waits ``DEMO_COMPLETION_DELAY`` seconds while showing progress.
+    5. Prints FINISHED status, sends "PR Ready" Slack notification, and
+       posts a completion comment on the existing PR.
+
+    Returns a result dict identical in shape to the real dispatch path.
+    """
+    session_id = f"devin-{uuid.uuid4().hex[:32]}"
+    session_url = f"https://app.devin.ai/sessions/{session_id}"
+    branch_name = f"fix/issue-{issue.number}"
+
+    # --- Fake session creation ---
+    logger.info("Creating Devin session via %s ...", DEVIN_API_URL)
+    time.sleep(0.5)  # small pause to feel realistic
+    logger.info("Devin session created successfully.")
+    logger.info(
+        "Issue #%d -> Session %s (%s)", issue.number, session_id, session_url
+    )
+
+    # Post comment on the GitHub issue (real, but may 403)
+    post_github_comment(issue, session_url)
+
+    # Send initial "Automation Triggered" Slack notification (real webhook)
+    send_slack_notification(issue, session_url, repo_name)
+
+    # --- Simulated polling output ---
+    ts_now = datetime.now(tz=timezone.utc)
+
+    # Show WORKING status
+    ts_str = ts_now.strftime("%H:%M:%S UTC")
+    logger.info(
+        "Polling session %s (every %ds, timeout %ds)...",
+        session_id,
+        DEVIN_POLL_INTERVAL,
+        DEVIN_POLL_TIMEOUT,
+    )
+    print(
+        f"  \U0001f504 [{ts_str}] Session {session_id[:12]}... -> WORKING"
+    )
+
+    # Wait the configured demo delay
+    time.sleep(DEMO_COMPLETION_DELAY)
+
+    # Show FINISHED status
+    ts_finished = datetime.now(tz=timezone.utc).strftime("%H:%M:%S UTC")
+    pr_url = f"https://github.com/{repo_name}/pull/{issue.number}"
+    print(
+        f"  \u2705 [{ts_finished}] Session {session_id[:12]}... -> FINISHED"
+    )
+    logger.info(
+        "Session %s reached terminal state: finished", session_id
+    )
+    print(f"  Final status: FINISHED  |  PR: {pr_url}")
+
+    # Send "PR Ready" Slack notification (real webhook)
+    _send_completion_slack(issue, repo_name)
+
+    # Update the existing PR with a completion comment
+    _update_existing_pr(GITHUB_TOKEN, repo_name, issue)
+
+    return {
+        "issue_number": issue.number,
+        "session_id": session_id,
+        "session_url": session_url,
+    }
 
 
 def _dispatch_single_issue(
@@ -787,12 +862,15 @@ def _dispatch_single_issue(
 ) -> dict[str, Any]:
     """Build prompt, create a Devin session, comment, and notify for one issue.
 
-    After the initial notification, waits a short delay and then sends a
-    completion notification to Slack and updates the existing PR on GitHub.
+    When ``DEMO_MODE`` is enabled the real Devin API is skipped and the
+    entire flow is simulated in the terminal with real Slack notifications.
 
     Returns a result dict with ``issue_number``, ``session_id``,
     ``session_url``, and optionally ``error``.
     """
+    if DEMO_MODE:
+        return _simulate_session(issue, repo_name)
+
     prompt = build_devin_prompt(issue, repo_name)
     response_data = create_devin_session(api_key, prompt)
 
@@ -814,17 +892,6 @@ def _dispatch_single_issue(
 
     # Send initial "Automation Triggered" Slack notification
     send_slack_notification(issue, session_url, repo_name)
-
-    # Simulate completion: wait, then send "PR Ready" and update the PR
-    logger.info(
-        "Simulating completion for Issue #%d in %ds...",
-        issue.number,
-        _DEMO_COMPLETION_DELAY,
-    )
-    time.sleep(_DEMO_COMPLETION_DELAY)
-
-    _send_completion_slack(issue, repo_name)
-    _update_existing_pr(GITHUB_TOKEN, repo_name, issue)
 
     return {
         "issue_number": issue.number,
@@ -912,9 +979,9 @@ def main() -> None:
     # Print executive summary dashboard
     print_summary_dashboard(results, selected_issues)
 
-    # 5. Session status polling (optional)
+    # 5. Session status polling (skip in demo mode — already shown inline)
     successes = [r for r in results if "error" not in r]
-    if successes:
+    if not DEMO_MODE and successes:
         _offer_session_polling(successes, DEVIN_API_KEY)
 
     logger.info("Pipeline complete. %d session(s) created.", len(successes))
